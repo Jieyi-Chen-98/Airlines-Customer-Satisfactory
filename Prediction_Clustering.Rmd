@@ -1,0 +1,627 @@
+---
+title: "Airlines Customer Satisfactory"
+output:
+  pdf_document: default
+  html_document: default
+---
+# Basic Setup
+
+```{r warning=FALSE, message=FALSE}
+rm(list = ls())
+
+library(dplyr)
+library(Matrix)
+library(glmnet)
+library(caret)
+library(ROCR)
+library(rpart)
+library(rpart.plot)
+library(ggplot2)
+library(stringr)
+library(boot)
+library(kknn)
+library(tree) # decision tree
+library(ranger) # random forest
+library(xgboost) # boosting
+library(factoextra)
+library(h2o) # neural network
+
+setwd("/Users/chenjieyi/Documents/GitHub/Airlines-Customer-Satisfactory")
+
+data_train <- read.csv("train.csv")
+data_train <- data_train[, c(-1, -2)]
+
+data_test <- read.csv("test.csv")
+data_test <- data_test[, c(-1, -2)]
+```
+
+# Data Manipulation
+
+1. Capitalize "disloyal Customers".  
+2. Drop 0 values in columns 7-20, as 0 means NA in the scale.  
+3. Drop NA values in all the columns.  
+4. Change character and columns 7-20 into factor. 
+
+```{r}
+chg_df <- function(df) {
+  
+  df[, 2] <- str_to_title(df[, 2])
+  
+  for (i in 7:20) {
+    df <- df[df[, i]!=0, ] 
+    df[, i] <- as.factor(df[, i]) 
+  }
+  
+  df <- na.omit(df) 
+  
+  df <- mutate_if(df, is.character, as.factor)
+}
+
+data_train <- chg_df(data_train)
+data_test <- chg_df(data_test)
+```
+
+# Preliminary Analysis
+
+Check satisfaction distribution by customer type, type of travel, and flight class.
+
+```{r}
+draw_bar <- function(df = data_train, x, y = 23) {
+  table_count <- table(df[, x], df[, y])
+  barplot(table_count, 
+          main = paste0("Satisfaction Distribution by ", colnames(df)[x]),
+          xlab = str_to_title(colnames(df)[y]),
+          col = c("pink", "orange", "darkred"))
+  legend("topright", legend = rownames(table_count), 
+         col = c("pink", "orange", "darkred"), 
+         pch = 16, cex = 0.8, bty = "n")
+}
+
+draw_bar(x = 2)
+draw_bar(x = 4)
+draw_bar(x = 5)
+```
+
+# Split training and validation set
+
+```{r}
+set.seed(202203)
+n <- nrow(data_train)
+ratio <- 0.75
+train_index <- sample(n, ratio * n)
+data_train_2 <- data_train[train_index, ]
+data_val_2<- data_train[-train_index, ]
+```
+
+# Variable selection
+
+```{r}
+set.seed(202203)
+data_numeric <- data_train_2
+for(i in 1:22){
+  data_numeric[, i] <- as.numeric(data_numeric[,i])
+}
+X_train <- model.matrix(satisfaction ~ ., data = data_numeric)
+X_train <- X_train[,-1]
+Y_train <- data_numeric$satisfaction
+
+cv_l1_lgfit <- cv.glmnet(x = X_train, y = Y_train, family = "binomial",
+                         alpha = 1, nfolds = 5)
+
+# Get selected variables
+betas <- coef(cv_l1_lgfit, s = "lambda.min")
+model_1se <- which(betas[2:length(betas)]!=0)
+var_selected <- colnames(X_train[, model_1se])
+data_train_select <- data_train[, var_selected]
+satisfaction <- data_train$satisfaction
+data_train_select <- cbind(data_train_select, satisfaction)
+data_test_select <- data_test[, var_selected]
+satisfaction <- data_test$satisfaction
+data_test_select <- cbind(data_test_select, satisfaction)
+
+# Check the dropped variable and found high correlation with other
+cor(data_train$Arrival.Delay.in.Minutes,
+    data_train$Departure.Delay.in.Minutes)
+```
+
+# Logistic regression
+
+```{r}
+set.seed(202203)
+
+lgfit <- glm(satisfaction ~ . , data_train_2, family = "binomial")
+
+phat_lgfit <- predict(lgfit, data_val_2, type = "response")
+
+#Variable importance
+imp_lgfit <- as.data.frame(varImp(lgfit, scale = TRUE))
+imp_lgfit$names <- rownames(imp_lgfit)
+imp_lgfit$Overall <-
+  imp_lgfit$Overall/max(imp_lgfit$Overall)
+imp_lgfit <- imp_log[c(1:10), ]
+imp_log <- imp_log[order(imp_log$Overall, decreasing = TRUE), ]
+
+# Output variable importance plots
+png(height = 600, width = 800, file = "Var_Log.png", res = 96)
+par(mar = c(5.1, 14.1, 4.1, 2.1))
+barplot(height = rev(imp_log$Overall), 
+        names = rev(imp_log$names), 
+        horiz = TRUE, xlab = NA, 
+        main = "Variable Importance for Logistic Regression", 
+        las = 2, cex.lab = 0.5)
+dev.off()
+
+pred <- prediction(phat_lgfit, data_val_2$satisfaction)
+perf <- ROCR::performance(pred, measure = "auc")
+print(round(perf@y.values[[1]], 3))
+```
+
+# Decision Tree
+
+```{r}
+set.seed(202203)
+
+hyper_grid_tree <- expand.grid(
+  max_depth = seq(5, 25, by = 5),
+  node_size  = seq(5, 25, by = 5),  
+  cp = c(0.001, 0.005, 0.01, 0.05),
+  error   = 0
+)
+
+for(i in 1:nrow(hyper_grid_tree)) {
+  
+  # train model
+  model_tree <- rpart(
+    formula         = satisfaction ~ ., 
+    data            = data_train_2, 
+    method          = "class",
+    control         = rpart.control (xval = 5)
+  )
+ 
+  ind = which.min(model_tree$cptable[, "xerror"])
+  hyper_grid_tree$best_cp[i] <- model_tree$cptable[ind, "CP"]
+  hyper_grid_tree$error[i] <- model_tree$cptable[ind, "xerror"]
+
+}
+
+(oo = hyper_grid_tree %>% 
+  dplyr::arrange(error) %>%
+  head(10))
+
+best_tree <- rpart(
+    formula         = satisfaction ~ ., 
+    data            = data_train_2, 
+    method          = "class",
+    control         = rpart.control(minbucket = oo[1,]$node_size,
+                                    maxdepth = oo[1,]$max_depth,
+                                    cp = oo[1,]$best_cp
+                                    )
+)
+
+#Predict values
+phat_tree <- predict(best_tree, data_val_2)[, 2]
+
+#Variable importance plot  
+imp_tree <- as.data.frame(best_tree$variable.importance)
+names <- rownames(imp_tree)
+imp_tree <- cbind(names, imp_tree[[1]]) %>% as.data.frame()
+colnames(imp_tree) <- c("names", "importance")
+par(mar = c(5.1, 12.1, 4.1, 2.1))
+
+a <- max(imp_tree$importance)
+imp_tree <- imp_tree %>% 
+  mutate(importance = as.numeric(importance)/as.numeric(a))
+barplot(height = rev(imp_tree$importance), names = rev(imp_tree$names), 
+        horiz = TRUE, xlab = NA, 
+        main = "Variable Importance for Decision Tree", 
+        las = 2, cex.lab = 0.5)
+
+pred = prediction(phat_tree, data_val_2$satisfaction)
+perf = ROCR::performance(pred, measure = "auc")
+print(round(perf@y.values[[1]], 3))
+```
+
+# Random Forest
+
+```{r}
+p <- ncol(data_val_2)-1
+
+hyper_grid_rf <- expand.grid(
+  mtry       = c(p, ceiling(p)),
+  node_size  = seq(5, 25, by = 5),  
+  sample_size = c(.60, .70, .80),   
+  OOB_error   = 0                          
+)
+
+for(i in 1:nrow(hyper_grid_rf)) {
+
+  model <- ranger(
+    formula         = satisfaction ~ ., 
+    data            = data_train_2, 
+    num.trees       = 250,
+    mtry            = hyper_grid_rf$mtry[i],
+    min.node.size   = hyper_grid_rf$node_size[i],
+    sample.fraction = hyper_grid_rf$sample_size[i],
+    seed            = 2009,
+    importance = "impurity"
+  )
+  
+  hyper.grid.rf$OOB_error[i] <- (model$prediction.error)
+}
+
+(oo = hyper.grid.rf %>% 
+  dplyr::arrange(OOB_error) %>%
+  head(10))
+
+random.forest.model <- ranger(
+    formula         = satisfaction ~ ., 
+    data            = data_train_2, 
+    num.trees       = 250,
+    mtry            = oo[1,]$mtry,
+    min.node.size   = oo[1,]$node_size,
+    sample.fraction = oo[1,]$sample_size,
+    importance      = 'impurity',
+    probability     = TRUE
+    )
+
+phat.random.forest <- predict(random.forest.model, data_val_2)$predictions[,2]
+
+#Variable importance plot
+var.imp <- as.data.frame(importance(random.forest.model))
+names <- rownames(var.imp)
+var.imp.rf <- cbind(names, var.imp)
+colnames(var.imp.rf) <- c("names", "importance")
+var.imp.rf <- var.imp.rf[order(var.imp.rf$importance, decreasing = TRUE), ]
+var.imp.rf <- var.imp.rf[c(1:10),]
+var.imp.rf$seq = seq_along(var.imp.rf$importance)
+par(mar = c(5.1, 12.1, 4.1, 2.1))
+var.imp.rf$importance <- var.imp.rf$importance  /max(var.imp.rf$importance)
+barplot(height = rev(var.imp.rf$importance), names = rev(var.imp.rf$names), horiz = TRUE, xlab = NA, main = "Variable Importance for Random Forest", las = 2, cex.lab = 0.5)
+
+pred = prediction(phat.random.forest, data_val_2$satisfaction)
+perf = ROCR::performance(pred, measure = "auc")
+print(round(perf@y.values[[1]], 3))
+```
+
+# Boosting
+
+```{r}
+train.Y <- as.numeric(data_train_2[, 22])-1
+val.Y <- as.numeric(data_val_2[, 22])-1
+
+train.X = sparse.model.matrix(satisfaction ~ ., data = data_train_2)[,-1]
+val.X = sparse.model.matrix(satisfaction ~ ., data = data_val_2)[,-1]
+
+hyper.grid.boost <- expand.grid(
+  shrinkage = c(.01, .1, .3),     
+  interaction.depth = c(1, 3, 5), 
+  bag.fraction = c(.60, .70, .80),  
+  optimal_trees = 0,              
+  min_error = 0                    
+)
+
+for(i in 1:nrow(hyper.grid.boost)) {
+  
+  # create parameter list
+  params <- list(
+    eta = hyper.grid.boost$shrinkage[i],
+    max_depth = hyper.grid.boost$interaction.depth[i],
+    subsample = hyper.grid.boost$bag.fraction[i]
+  )
+  
+
+  # train model using Cross Validation
+  xgb.tune <- xgb.cv(
+    params = params,
+    data = train.X,
+    label = train.Y,
+    nrounds = 200,
+    nfold = 5,
+    objective = "binary:logistic",
+    metrics = "error",
+    verbose = 0,                        
+    early_stopping_rounds = 10          
+  )
+  
+  # add min training error and trees to grid
+  hyper.grid.boost$optimal_trees[i] <- which.min(xgb.tune$evaluation_log$test_error_mean)
+  hyper.grid.boost$min_error[i] <- min(xgb.tune$evaluation_log$test_error_mean )
+}
+
+(oo = hyper.grid.boost %>%
+      dplyr::arrange(min_error) %>%
+      head(10))
+
+params <- list(
+  eta = oo[1,]$shrinkage,
+  max_depth = oo[1,]$interaction.depth,
+  subsample = oo[1,]$bag.fraction
+)
+
+boost.model <- xgboost(
+  params = params,
+  data = train.X,
+  label = train.Y,
+  nrounds = oo[1,]$optimal_trees,
+  objective = "binary:logistic",
+  verbose = 0
+)
+
+var.imp <- as.data.frame(xgb.importance(model = boost.model))
+var.imp$Gain <- var.imp$Gain / max(var.imp$Gain)
+var.imp <- var.imp[c(1:5),]
+par(mar = c(5.1, 13.1, 4.1, 2.1))
+
+barplot(height = rev(var.imp$Gain), names = rev(var.imp$Feature), horiz = TRUE, xlab = NA, main = "Variable Importance for Boosting Model", las = 2, cex.lab = 0.1)
+
+phat.boost <- predict(boost.model, val.X, type = "response")
+
+pred = prediction(phat.boost, data_val_2$satisfaction)
+perf = ROCR::performance(pred, measure = "auc")
+print(round(perf@y.values[[1]], 3))
+```
+
+# Neural Network
+
+```{r}
+h2o.init()
+data.train.nn <- as.h2o(data_train_2)
+data.val.nn <- as.h2o(data_val_2)
+```
+
+```{r}
+splits <- h2o.splitFrame(data.train.nn, ratios = 0.8, seed = 2009)
+train <- h2o.assign(splits[[1]], "train.hex")
+valid <- h2o.assign(splits[[2]], "valid.hex")
+response <- "satisfaction"
+predictors <- setdiff(names(data.train.nn), response)
+```
+
+```{r}
+hyper.params <- list(
+  activation = c("Rectifier", "Tanh", "RectifierWithoutDropout", "TanhWithDropout"),
+  hidden = list(c(20,20), c(50, 50), c(30, 30, 30), c(25, 25, 25, 25), c(64, 64, 64, 64)),
+  input_dropout_ratio = c(0, 0.05),
+  l1 = seq(0, 1e-4, 1e-6),
+  l2 = seq(0, 1e-4, 1e-6),
+  max_w2 = c(5, 10, 15)
+)
+
+search.criteria = list(
+  strategy = "RandomDiscrete",
+  max_runtime_secs = 360,
+  max_models = 100,
+  seed = 2009,
+  stopping_rounds = 5,
+  stopping_tolerance = 1e-2
+)
+
+d1_random_grid <- h2o.grid(
+  algorithm = "deeplearning",
+  grid_id = "d1_grid_random",
+  training_frame = train,
+  validation_frame = valid,
+  x = predictors,
+  y = response,
+  epochs = 10,
+  stopping_metric = "logloss",
+  stopping_tolerance = 1e-2,
+  stopping_rounds = 2,
+  score_duty_cycle = 0.025,
+  hyper_params = hyper.params,
+  search_criteria = search.criteria
+)
+```
+
+```{r}
+grid <- h2o.getGrid("d1_grid_random", sort_by = "logloss", decreasing = FALSE)
+best.model <- h2o.getModel(grid@model_ids[[1]])
+h2o.performance(best.model, newdata = data.val.nn)
+par(mar = c(5.1, 8.1, 4.1, 2.1))
+h2o.varimp_plot(best.model, num_of_features = 15)
+phat.nn <- h2o.predict(best.model, data.val.nn)
+phat.nn <- as.data.frame(phat.nn)
+phat.nn <- phat.nn[,3]
+
+pred = prediction(phat.nn, data_val_2$satisfaction)
+perf = ROCR::performance(pred, measure = "auc")
+print(round(perf@y.values[[1]], 3))
+
+str(data.train.nn)
+```
+
+
+# Select best values, compute deviance and RMSE
+
+Already have values for logistic and neural network
+
+```{r}
+phat.best <- cbind(phat.lgfit, phat_tree, phat.random.forest, phat.boost, phat.nn)
+colnames(phat.best) <- c("Logistic", "Decision Tree", "Random Forest", "Boosting", "Neural Network")
+
+#Compute deviance for each model
+get.deviance <- function(phat.df){
+  deviance.vec <- c()
+  for(i in 1:ncol(phat.df)){
+    converted.num = as.numeric(data_val_2$satisfaction) - 1
+    py = ifelse(converted.num==1, phat.df[,i], 1-phat.df[,i])
+    py <- py[log(py) != -Inf]
+    deviance <- -2*sum(log(py))
+    deviance.vec <- c(deviance.vec, deviance)
+  }
+  deviance.vec
+}
+
+get.deviance(phat.best)
+```
+
+# Plot Curves
+
+```{r}
+#ROC
+for(i in 1:ncol(phat.best)){
+  pred = prediction(phat.best[,i], data_val_2$satisfaction)
+  perf = ROCR::performance(pred, measure = "tpr", x.measure = "fpr")
+  if(i == 1){
+    plot(perf, col = 1, main = "ROC Curve")
+  }
+  else{
+    plot(perf, add = T, col = i)
+  }
+}
+legend("bottomright", legend = colnames(phat.best), col = 1:5, lty = rep(1,5))
+
+#AUC
+for(i in 1:ncol(phat.best)){
+  pred = prediction(phat.best[,i], data_val_2$satisfaction)
+  perf = ROCR::performance(pred, measure = "auc")
+  print(paste("AUC for", colnames(phat.best)[i], "is:",round(perf@y.values[[1]], 3)))
+}
+
+#Lift Curve
+pred = prediction(phat.best[,1], data_val_2$satisfaction)
+perf = ROCR::performance(pred, measure = "lift", x.measure = "rpp")
+plot(perf, col = 1, main = "Lift Curves")
+for(i in 2:ncol(phat.best)){
+  pred = prediction(phat.best[,i], data_val_2$satisfaction)
+  perf = ROCR::performance(pred, measure = "lift", x.measure = "rpp")
+  plot(perf, col = i, add = T)
+}
+legend("topright", legend = colnames(phat.best), col = 1:5, lty = rep(1,5))
+
+phat.val <- ifelse(phat.best > 0.5, 1, 0)
+phat.val <- as.data.frame(phat.val)
+for(i in 1:ncol(phat.val)){
+  phat.val[,i] <- as.factor(phat.val[,i])
+}
+
+levels(data_val_2$satisfaction)[1] <- "0"
+levels(data_val_2$satisfaction)[2] <- "1"
+
+str(phat.val[,1])
+str(data_val_2$satisfaction)
+
+for (i in 1:5){
+  confusionMatrix(phat.val[,i], data_val_2$satisfaction)
+}
+```
+
+# Train best model (random forest) on test set
+
+```{r}
+phat.best.test <- predict(random.forest.model, data.test)$predictions[,2]
+
+#ROC
+  pred = prediction(phat.best.test, data.test$satisfaction)
+  perf = ROCR::performance(pred, measure = "tpr", x.measure = "fpr")
+  plot(perf, col = 1, main = "ROC Curve")
+
+
+#AUC
+  perf = ROCR::performance(pred, measure = "auc")
+  print(paste("AUC  is:",round(perf@y.values[[1]], 3)))
+
+#Lift Curve
+perf = ROCR::performance(pred, measure = "lift", x.measure = "rpp")
+plot(perf, col = 1, main = "Lift Curves")
+
+phat.best.test <- ifelse(phat.best.test > 0.5, 1, 0)
+phat.best.test <- as.factor(phat.best.test)
+levels(data.test$satisfaction)[1] <- "0"
+levels(data.test$satisfaction)[2] <- "1"
+confusionMatrix(phat.best.test, data.test$satisfaction)
+```
+
+# Clustering
+
+Decide cluster size. 
+
+```{r}
+# data manipulation
+data_train_cl1 <- data_train %>%
+  mutate(Gender_2 = ifelse(Gender == "Male", 1, 0),
+         Customer.Type_2 = ifelse(Customer.Type == "Loyal Customer", 1, 0),
+         Type.of.Travel_2 = ifelse(Type.of.Travel == "Business travel", 1, 0),
+         Class_2 = ifelse(Class == "Business", 2 , ifelse(Class == "Eco", 0, 1)),
+         Satisfaction_2 = ifelse(satisfaction == "satisfied", 1, 0)) %>% 
+  select(-c(Gender, Customer.Type, Type.of.Travel, Class, satisfaction))
+
+for(i in 1:23){
+  data_train_cl1[,i] <- as.numeric(data_train_cl1[,i])
+  data_train_cl1[,i] <- as.numeric(data_train_cl1[,i])
+}
+
+data_train_cl2 <- data_train_cl1 %>% 
+  select(Customer.Type_2, Type.of.Travel_2, Class_2)
+
+# cluster on customer type, type of travel and flight class
+
+set.seed(77)
+
+cl2 <- kmeans(data_train_cl2, centers = 2, nstart = 1000, iter.max = 100)
+cl3 <- kmeans(data_train_cl2, centers = 3, nstart = 1000, iter.max = 100)
+cl4 <- kmeans(data_train_cl2, centers = 4, nstart = 1000, iter.max = 100)
+cl5 <- kmeans(data_train_cl2, centers = 5, nstart = 1000, iter.max = 100)
+
+pl2 <- fviz_cluster(cl2, geom = "point", data = data_train_cl2) + 
+  ggtitle("k = 2")
+pl3 <- fviz_cluster(cl3, geom = "point", data = data_train_cl2) + 
+  ggtitle("k = 3")
+pl4 <- fviz_cluster(cl4, geom = "point", data = data_train_cl2) + 
+  ggtitle("k = 4")
+pl5 <- fviz_cluster(cl5, geom = "point", data = data_train_cl2) + 
+  ggtitle("k = 5")
+
+gridExtra::grid.arrange(pl2, pl3, pl4, pl5, ncol = 2)
+```
+
+Check cluster distribution. 
+
+```{r}
+cluster_df <- data_train
+cluster_df$cluster <- cl3$cluster
+
+plot_cluster <- function(var) {
+  cluster_dist <- cluster_df %>% 
+    rename(n = as.name(var)) %>% 
+    ggplot(aes(n, fill = factor(cluster))) +
+    geom_bar(position = "dodge2") +
+    ggtitle(paste0(var, " Distribution on Each Cluster")) +
+    guides(fill = guide_legend(title = "Cluster")) +
+    xlab(var)
+  
+  return(cluster_dist)
+}
+
+plot_cluster("Type.of.Travel")
+plot_cluster("Class")
+plot_cluster("Customer.Type")
+
+```
+
+Plot how each cluster satisfied on services provided. 
+
+```{r}
+plot_cluster_satisfaction <- function(var) {
+  cluster_performace <- cluster_df %>% 
+    rename(n = as.name(var)) %>% 
+    ggplot(aes(x = factor(cluster), fill = as.factor(n))) +
+    geom_bar(stat = "count", position = "fill") +
+    guides(fill = guide_legend(title = var)) +
+    ggtitle(paste0(var, " Satisfaction Distribution")) +
+    xlab("Cluster") +
+    ylab("Proportion")
+  
+  return(cluster_performace)
+}
+
+plot_cluster_satisfaction("Inflight.service")
+plot_cluster_satisfaction("Inflight.wifi.service")
+plot_cluster_satisfaction("Online.boarding")
+plot_cluster_satisfaction("Inflight.entertainment")
+```
+
+
+
+
+
